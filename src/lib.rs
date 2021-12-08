@@ -1,5 +1,12 @@
+use anyhow::Context;
 use blake2b_simd::Params;
-use std::convert::TryInto;
+use futures::{
+    future::{BoxFuture, LocalBoxFuture},
+    FutureExt,
+    StreamExt,
+};
+use radixtree::radix_tree::{BlobStore as AsyncBlobStore, Tree as AsyncRadixTree, TreeStore};
+use std::{convert::TryInto, sync::Arc};
 use wasm_bindgen::prelude::*;
 
 type Hash = [u8; 32];
@@ -116,8 +123,43 @@ impl FileStore {
     }
 }
 
+#[derive(Debug)]
 pub struct BlobStore {
     db: IdbDatabase,
+}
+
+unsafe impl Sync for BlobStore {}
+unsafe impl Send for BlobStore {}
+
+impl AsyncBlobStore for BlobStore {
+    fn load(&self, hash: Hash) -> BoxFuture<'_, anyhow::Result<Arc<[u8]>>> {
+        console_log!("load {}", hex::encode(&hash));
+        let future: LocalBoxFuture<'_, anyhow::Result<Arc<[u8]>>> = async move {
+            let mut tx = self.tx().map_err(|e| anyhow::anyhow!("tx error {:?}", e))?;
+            let res = tx
+                .get(&hash)
+                .await
+                .map_err(|e| anyhow::anyhow!("get error {:?}", e))?;
+            let res = res.context("value not found")?;
+            Ok(res.into())
+        }
+        .boxed_local();
+        unsafe { std::mem::transmute(future) }
+    }
+
+    fn store(&self, _hash: Hash, value: &[u8]) -> BoxFuture<'_, anyhow::Result<()>> {
+        let future: LocalBoxFuture<'_, anyhow::Result<()>> = async move {
+            let mut tx = self.tx().map_err(|e| anyhow::anyhow!("tx error {:?}", e))?;
+            tx.put(value)
+                .map_err(|e| anyhow::anyhow!("put error {:?}", e))?;
+            tx.commit()
+                .await
+                .map_err(|e| anyhow::anyhow!("commit error {:?}", e))?;
+            Ok(())
+        }
+        .boxed_local();
+        unsafe { std::mem::transmute(future) }
+    }
 }
 
 pub struct Transaction<'a> {
@@ -136,7 +178,7 @@ impl<'a> Transaction<'a> {
         let value = Uint8Array::from(data);
         // let key = JsValue::from(hex::encode(hash.as_bytes()));
         // let value = JsValue::from(hex::encode(data));
-        // console_log!("put key={} value={}", hex::encode(hash.as_bytes()), hex::encode(data));
+        console_log!("put key={} value={}", hex::encode(hash.as_bytes()), hex::encode(data));
         self.blobs.put_key_val(&key, &value)?;
         let hash = hash.as_bytes().try_into().expect("hash should be 32 bytes");
         Ok(hash)
@@ -144,15 +186,19 @@ impl<'a> Transaction<'a> {
 
     pub async fn get(&mut self, hash: &Hash) -> Result<Option<Vec<u8>>, DomException> {
         let key = Uint8Array::from(&hash[..]);
-        // let key = JsValue::from(hex::encode(&hash[..]));
-        // console_log!("get key={}", hex::encode(&hash[..]));
+        // let key = JsValue::from(hex::encode(&hash[..]));        
+        console_log!("get key={}", hex::encode(&hash[..]));
         Ok(match self.blobs.get_owned(key)?.await? {
             Some(data) => {
                 let data: Uint8Array = data.into();
                 let data = data.to_vec();
+                console_log!("got {}", hex::encode(&data));
                 Some(data)
             }
-            None => None,
+            None => {
+                console_log!("got None");
+                None
+            }
         })
     }
 
@@ -192,45 +238,40 @@ impl BlobStore {
 
 #[wasm_bindgen(start)]
 pub async fn run() -> Result<(), DomException> {
-    console_log!("hello, is this thing on?");
-
-    let files = FileStore::new("files").await?;
-    for i in 0..1000u64 {
-        if i % 100 == 0 {
-            console_log!("test {}", i);
-        }
-        let t = [0u8; 10000];
-        files.append("temp", &t[..]).await?;
+    let blobs = Arc::new(BlobStore::new("tlfs2").await?);
+    let trees = TreeStore::new(blobs.clone());
+    let mut tree = AsyncRadixTree::empty();    
+    for i in 0..10000 {
+        console_log!("{}", i);
+        let k: Arc<[u8]> = i.to_string().as_bytes().to_vec().into();
+        tree.union_with(&AsyncRadixTree::single(k.clone(), k), &trees.reader)
+            .await
+            .map_err(|e| DomException::new().unwrap())?;
     }
-    files.mv("temp", "test").await?;
-    files.load("test", Box::new(|x| {
-        let mut text = hex::encode(x);
-        text.truncate(100);
-        console_log!("{}...", text);
-        
-    })).await?;
+    console_log!("{:?}", tree);
+    tree.shrink(&trees.writer).await.map_err(|e| DomException::new().unwrap())?;
+    console_log!("{:?}", tree);
 
-    let blobs = BlobStore::new("tlfs").await?;
-    let mut tx = blobs.tx()?;
-    let mut hashes = Vec::new();
-    for i in 0..100u64 {
-        hashes.push(tx.put(&i.to_be_bytes())?);
+    let v = blobs.load([57, 243, 64, 152, 186, 109, 72, 192, 164, 143, 196, 223, 130, 233, 170, 107, 167, 190, 14, 74, 249, 169, 155, 175, 121, 164, 58, 122, 215, 198, 104, 161]).await;
+    console_log!("manual1 {:?}", v);
+    let v = trees.reader.load([57, 243, 64, 152, 186, 109, 72, 192, 164, 143, 196, 223, 130, 233, 170, 107, 167, 190, 14, 74, 249, 169, 155, 175, 121, 164, 58, 122, 215, 198, 104, 161]).await;
+    console_log!("manual2 {:?}", v);
+    tree.ensure_data(&trees.reader).await.map_err(|e| DomException::new().unwrap())?;
+    console_log!("manual3 {:?}", tree);
+
+    let mut stream = tree.stream(&trees.reader);
+    console_log!("streaming tree");
+    stream.next().await;
+    console_log!("streaming tree");    
+    while let Some(Ok((k, v))) = stream.next().await {
+        console_log!("{}=>{}", hex::encode(k), hex::encode(v));
     }
-    tx.commit().await?;
     console_log!("done");
-    let mut tx = blobs.tx()?;
-    let mut sum = 0;
-    for hash in hashes.into_iter().rev() {
-        let blob = tx.get(&hash).await?;
-        let blob = blob.unwrap();
-        sum += u64::from_be_bytes(blob.as_slice().try_into().unwrap());
-    }
-    console_log!("sum {}", sum);
     Ok(())
 }
 
 use indexed_db_futures::{
-    js_sys::{Array, Uint8Array, Reflect, Object},
+    js_sys::{Array, Object, Reflect, Uint8Array},
     prelude::*,
 };
 use web_sys::{DomException, IdbKeyRange};

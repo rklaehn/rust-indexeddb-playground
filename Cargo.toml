@@ -1,7 +1,7 @@
 [package]
-name = "console_log"
+name = "rust-indexeddb-playground"
 version = "0.1.0"
-authors = ["The wasm-bindgen Developers"]
+authors = ["Rüdiger Klaehn"]
 edition = "2018"
 
 [lib]
@@ -13,5 +13,7 @@ blake2b_simd = "1.0.0"
 wasm-bindgen = "0.2.78"
 wasm-bindgen-futures = "0.4.28"
 web-sys = { version = "0.3.55", features = ['console', 'Blob', 'IdbIndex', 'IdbObjectStore'] }
-parking_lot = "0.11.2"
+radixtree = { path = "../radixtree" }
 hex = "0.4.3"
+futures = "0.3.18"
+anyhow = "1.0.51"
